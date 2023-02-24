@@ -18,8 +18,8 @@ func TestXxx(t *testing.T) {
 	want.PushBack(&Counter{Value: 5, Item: "e"})
 	p := want.Head
 	topK := summary.TopK(3)
-	for e := topK.Front(); e != nil; e = e.Next() {
-		if e.Value != p.Value {
+	for e := topK.Front(); e != nil; e = e.Next {
+		if e.Value.Item != p.Value.Item || e.Value.Value != p.Value.Value {
 			t.Fatalf("want %v, got %v", p.Value, e.Value)
 		}
 		p = p.Next

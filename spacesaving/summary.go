@@ -1,7 +1,6 @@
 package spacesaving
 
 import (
-	"container/list"
 	"fmt"
 	"math"
 	"sync/atomic"
@@ -41,8 +40,8 @@ func New(epsilon float64) *summary {
 	}
 }
 
-func (s *summary) TopK(k int) *list.List {
-	head := list.New()
+func (s *summary) TopK(k int) *List {
+	head := newList()
 	bucket := s.Buckets.Head
 	for bucket != nil {
 		child := bucket.Bucket.Children.Front()
