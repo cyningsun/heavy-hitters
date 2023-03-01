@@ -1,155 +1,146 @@
 package countminsketch
 
 import (
-	"encoding/binary"
-	"fmt"
-	"hash"
+	"container/heap"
 	"hash/fnv"
+	"log"
 	"math"
-	"sync"
-	"unsafe"
+
+	"github.com/cyningsun/heavy-hitters/internal/queue"
 )
 
-type CountType uint32
+// https://zhuanlan.zhihu.com/p/369981005
 
-const Max = ^(CountType(0))
+type summary struct {
+	sketch *CountMinSketch
+	k      int
+	queue  queue.PriorityQueue
+	counts map[string]*queue.Item
+}
 
-type Sketch struct {
-	width  uint32
-	depth  uint32
-	count  [][]CountType
-	hasher hash.Hash64
-	mutex  sync.RWMutex
+func New(sketch *CountMinSketch, k int) *summary {
+	return &summary{
+		sketch: sketch,
+		k:      k,
+		queue:  make(queue.PriorityQueue, 0, k),
+		counts: make(map[string]*queue.Item, k),
+	}
+}
+
+func (s *summary) Incr(str string) {
+	count := s.sketch.Increment(str)
+	_, ok := s.counts[str]
+	switch {
+	case !ok && len(s.queue) < s.k:
+		it := &queue.Item{
+			Value: str,
+			Count: count,
+			Index: 0,
+		}
+
+		heap.Push(&s.queue, it)
+		s.counts[str] = it
+	case !ok && len(s.queue) >= s.k && count > s.queue[0].Count:
+		minItem := heap.Pop(&s.queue).(*queue.Item)
+		delete(s.counts, minItem.Value)
+		minItem.Value = str
+		minItem.Count = count
+		s.counts[str] = minItem
+		heap.Push(&s.queue, minItem)
+	case !ok && len(s.queue) >= s.k && count <= s.queue[0].Count: // do nothing
+	case ok:
+		s.counts[str].Count = count
+		heap.Fix(&s.queue, s.counts[str].Index)
+	}
+}
+
+func (s *summary) TopK() map[string]int {
+	result := make(map[string]int)
+	for _, each := range s.queue {
+		result[each.Value] = each.Count
+	}
+
+	return result
 }
 
 // WithEstimates creates a Count-Min Sketch with given error rate and confidence.
 // Accuracy guarantees will be made in terms of a pair of user specified parameters,
 // ε and δ, meaning that the error in answering a query is within a factor of ε with
 // probability δ
-func WithEstimates(epsilon, delta float64) (sk *Sketch) {
+func WithEstimates(epsilon, delta float64) (sk *CountMinSketch) {
 	const (
 		defaultErrorRatio  = 1.0 / 1e3 // 0.1%
 		defaultUncertainty = 1.0 / 1e3 // 0.1%
 	)
 	if epsilon < 1.0/1e9 || epsilon > 0.1 {
-		fmt.Printf("error ratio %g not in [1e-9,0.1], use default %g\n", epsilon, defaultErrorRatio)
+		log.Printf("error ratio %g not in [1e-9,0.1], use default %g\n", epsilon, defaultErrorRatio)
 		epsilon = defaultErrorRatio
 	}
 	if delta < 1.0/1e9 || delta > 0.1 {
-		fmt.Printf("certainty %g not in [1e-9,0.1], use default %g\n", delta, defaultUncertainty)
+		log.Printf("certainty %g not in [1e-9,0.1], use default %g\n", delta, defaultUncertainty)
 		delta = defaultUncertainty
 	}
 
 	width := uint32(math.Ceil(2 / epsilon))
-	depth := uint32(math.Ceil(-math.Log(delta) / math.Log(2)))
-	return New(width, depth)
+	depth := uint32(math.Ceil(math.Log(1/delta) / math.Log(2)))
+	return NewCountMinSketch(depth, width)
 }
 
-// New returns a new Count-Min Sketch with the given width and depth.
-func New(width, depth uint32) (sk *Sketch) {
-	sk = &Sketch{
-		width:  width,
-		depth:  depth,
-		count:  make([][]CountType, depth),
-		hasher: fnv.New64(),
-	}
-	for i := uint32(0); i < depth; i++ {
-		sk.count[i] = make([]CountType, width)
-	}
-	return sk
+type CountMinSketch struct {
+	numHashes  uint32
+	numBuckets uint32
+	hashFuncs  []func(item string) uint32
+	counts     [][]int
 }
 
-// Width returns the width of the sketch.
-func (sk *Sketch) Width() uint32 { return sk.width }
-
-// Depth returns the depth of the sketch.
-func (sk *Sketch) Depth() uint32 { return sk.depth }
-
-// String returns a string representation of the sketch.
-func (sk *Sketch) String() string {
-	space := float64(int64(sk.width)*int64(sk.depth)*int64(unsafe.Sizeof(sk.count[0][0]))) / 1e6
-	return fmt.Sprintf("Count-Min Sketch(%p): width=%d, depth=%d, mem=%.3fm",
-		sk, sk.width, sk.depth, space)
-}
-
-// Clear resets the sketch.
-func (sk *Sketch) Clear() {
-	sk.mutex.Lock()
-	for i := uint32(0); i < sk.depth; i++ {
-		for j := uint32(0); j < sk.width; j++ {
-			sk.count[i][j] = 0
+func NewCountMinSketch(numHashes, numBuckets uint32) *CountMinSketch {
+	hashFuncs := make([]func(item string) uint32, numHashes)
+	for i := range hashFuncs {
+		h := fnv.New32a()
+		h.Write([]byte{byte(i)})
+		hashFuncs[i] = func(item string) uint32 {
+			h.Reset()
+			h.Write([]byte(item))
+			return h.Sum32()
 		}
 	}
-	sk.mutex.Unlock()
+
+	counts := make([][]int, numHashes)
+	for i := range counts {
+		counts[i] = make([]int, numBuckets)
+	}
+
+	return &CountMinSketch{
+		numHashes:  numHashes,
+		hashFuncs:  hashFuncs,
+		counts:     counts,
+		numBuckets: numBuckets,
+	}
 }
 
-// Incr increments the count for the given key by 1.
-func (sk *Sketch) Incr(key []byte) (min CountType) {
-	return sk.Add(key, 1)
-}
+func (cms *CountMinSketch) Increment(item string) int {
+	minCount := int(^uint(0) >> 1)
+	for i, hashFunc := range cms.hashFuncs {
+		hashValue := hashFunc(item)
+		bucket := hashValue % uint32(cms.numBuckets)
+		cms.counts[i][bucket]++
 
-// Add adds cnt to the count for the given key.
-func (sk *Sketch) Add(key []byte, cnt CountType) (min CountType) {
-	pos := sk.positions(key)
-	min = sk.query(pos)
-
-	min += cnt
-
-	sk.mutex.Lock()
-	for i := uint32(0); i < sk.depth; i++ {
-		v := sk.count[i][pos[i]]
-		if v < min {
-			sk.count[i][pos[i]] = min
+		if cms.counts[i][bucket] < minCount {
+			minCount = cms.counts[i][bucket]
 		}
 	}
-	sk.mutex.Unlock()
-
-	return min
+	return minCount
 }
 
-// Query returns the minimum count for the given key.
-// If the key does not exist, returns 0.
-func (sk *Sketch) Query(key []byte) (min CountType) {
-	pos := sk.positions(key)
-	return sk.query(pos)
-}
-
-// hashs returns the two hashes of key.
-// It uses the FNV hash function to compute the hashes.
-func (s *Sketch) hashs(key []byte) (a uint32, b uint32) {
-	s.hasher.Reset()
-	s.hasher.Write(key)
-	sum := s.hasher.Sum(nil)
-	upper := sum[0:4]
-	lower := sum[4:8]
-	a = binary.BigEndian.Uint32(lower)
-	b = binary.BigEndian.Uint32(upper)
-	return
-}
-
-// positions returns the indices of the counters that should be updated for a
-// given key. The indices are calculated using the double hashing technique.
-func (sk *Sketch) positions(key []byte) (pos []uint32) {
-	hash1, hash2 := sk.hashs(key)
-	pos = make([]uint32, sk.depth)
-	for i := uint32(0); i < sk.depth; i++ {
-		pos[i] = (hash1 + i*hash2) % sk.width
-	}
-	return pos
-}
-
-// query returns the minimum count for the given positions.
-func (sk *Sketch) query(pos []uint32) (min CountType) {
-	min = Max
-
-	sk.mutex.RLock()
-	for i := uint32(0); i < sk.depth; i++ {
-		v := sk.count[i][pos[i]]
-		if min > v {
-			min = v
+func (cms *CountMinSketch) Estimate(item string) int {
+	minCount := int(^uint(0) >> 1)
+	for i, hashFunc := range cms.hashFuncs {
+		hashValue := hashFunc(item)
+		bucket := hashValue % uint32(cms.numBuckets)
+		count := cms.counts[i][bucket]
+		if count < minCount {
+			minCount = count
 		}
 	}
-	sk.mutex.RUnlock()
-
-	return min
+	return minCount
 }
